@@ -1,5 +1,9 @@
 # Mamba: Linear-Time Sequence Modeling with Selective State Spaces
-视频讲解：https://www.bilibili.com/video/BV1JCrVYjEPN/?spm_id_from=333.337.search-card.all.click&vd_source=438c274850337b47a0be54ae5ef6d6ca 
+视频讲解：
+
+https://www.bilibili.com/video/BV1JCrVYjEPN/
+
+https://www.bilibili.com/video/BV17A4m1F7RX/
 
 知乎：https://zhuanlan.zhihu.com/p/680846351
 
