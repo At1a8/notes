@@ -291,80 +291,90 @@ class EAGLEWorker(TpModelWorker):
             batch: The batch to run forward. The state of the batch is modified as it runs.
         Returns:
             A tuple of the final logit output of the target model, next tokens accepted,
-            the batch id (used for overlap schedule), and number of accepted tokens.
-        """
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
-                batch
+            the batch id (used for overlap schedule), and number of accepted tokens.        # batch.forward_mode.is_extend(): 当前 batch 处于 Extend 模式（新请求或前缀扩展）
+        """                                                                                 # batch.is_extend_in_batch: 混合 batch 中包含 extend 请求（即使主模式是 decode）
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:                      # Extend 阶段需要特殊处理：Target Model 先执行，Draft Model 初始化
+            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(       # step1: Target Model 处理 prompt
+                batch                                                                       # step1: 返回 logits_output（含 full hidden states）、next_token_ids（首 token）、seq_lens_cpu
             )
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self.forward_draft_extend(
-                    batch,
-                    logits_output.hidden_states,
-                    next_token_ids,
+            with self.draft_tp_context(                                                     # draft_tp_context: 处理 DP Attention 的张量并行上下文
+                self.draft_model_runner.tp_group                                            # speculative_moe_backend_context: MoE 后端上下文
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():    # speculative_moe_a2a_backend_context: MoE all-to-all 通信上下文
+                self.forward_draft_extend(                                                  # step 2: 使用 Target 的 hidden_states 初始化 Draft Model
+                    batch,                                                                  # step 2: 让 Draft Model 的 KV cache 与 Target 对齐, 准备 Draft 的初始状态供后续 decode 使用
+                    logits_output.hidden_states,                                            # Target 的 hidden states
+                    next_token_ids,                                                         # Target 生成的首 token
                     seq_lens_cpu,
-                    logits_output.mm_input_embeds,
+                    logits_output.mm_input_embeds,                                          # ← 多模态输入（如有）
                 )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
-                can_run_cuda_graph=False,
+                num_accepted_tokens=0,                                                      # Extend 是初始化阶段，没有推测-验证循环, 无接受 token
+                can_run_cuda_graph=False,                                                   # Extend 阶段输入长度变化大，不适合 CUDA Graph
             )
         else:
             with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
-            )
+                self.draft_model_runner.tp_group                                            # Draft Model 生成 speculative_num_steps 步候选
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():    # 每步生成 topk 个分支，形成树形结构
+                spec_info = self.draft(batch)                                               # 返回 spec_info: EagleVerifyInput（包含树形掩码、候选 tokens 等）
+            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (        # Target Model 并行验证所有候选路径, 比较 Draft 和 Target 的 logits，决定接受哪些 token
+                self.verify(batch, spec_info)                                               # logits_output: Target 的输出（用于后续生成 logprob 等）, verify_output: EagleVerifyOutput: 验证结果（接受的 tokens、长度等）
+            )                                                                               # model_worker_batch: 模型 worker batch（用于 overlap schedule）, can_run_cuda_graph: 是否使用了 CUDA Graph
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():    # 准备下一轮 Draft
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
-                    self.server_args.enable_dp_attention
-                    or batch.spec_info.verified_id.shape[0] > 0
+                    self.server_args.enable_dp_attention                                    # enable_dp_attention: DP 模式下需要同步所有 rank
+                    or batch.spec_info.verified_id.shape[0] > 0                             # verified_id.shape[0] > 0: 还有 token 被接受（生成未结束）
                 ):
                     # decode is not finished
-                    self.forward_draft_extend_after_decode(batch)
+                    self.forward_draft_extend_after_decode(batch)                           # 基于验证结果更新 Draft Model 的状态 && 为下一轮 draft() 调用准备初始 hidden states 和 top-k 概率 && 恢复 batch 状态（如 seq_lens 等）
 
             return GenerationBatchResult(
                 logits_output=logits_output,
-                next_token_ids=verify_output.verified_id,
-                num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
-                accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
-                can_run_cuda_graph=can_run_cuda_graph,
+                next_token_ids=verify_output.verified_id,                                   # 验证后接受的 tokens
+                num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),           # 总接受数
+                accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,          # 每请求接受数
+                can_run_cuda_graph=can_run_cuda_graph,                                      # 是否用了 CUDA Graph
             )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.verified_id.shape[0] > 0
-        if not self.server_args.enable_dp_attention:
-            return local_need_forward
+        local_need_forward = batch.spec_info.verified_id.shape[0] > 0                       # batch.spec_info.verified_id: Verify 阶段被接受的 token IDs, shape[0] > 0: 本地有 token 被接受，生成未结束
+        if not self.server_args.enable_dp_attention:                                        # 如果没有启用 DP Attention，直接返回本地结果，无需同步。非 DP 模式下，每个 rank 独立处理自己的请求，不需要关心其他 rank 的状态
+            return local_need_forward                                                       # local_need_forward 是布尔值，表示当前 rank 是否需要继续 forward
 
-        global_need_forward = torch.tensor(
+        global_need_forward = torch.tensor(                                                 # 将本地布尔值包装成 1 元素的 int64 张量，用于后续的 all_reduce 通信
             [
                 (local_need_forward),
             ],
-            dtype=torch.int64,
+            dtype=torch.int64,                                                              # 用 int64 而非 bool，因为 all_reduce 对整数支持更好
         )
-        torch.distributed.all_reduce(
-            global_need_forward, group=get_tp_group().cpu_group
-        )
-        global_need_forward_cnt = global_need_forward[0].item()
-        need_forward = global_need_forward_cnt > 0
+        torch.distributed.all_reduce(                                                       # all_reduce: 将所有 rank 的值求和，广播到所有 rank
+            global_need_forward, group=get_tp_group().cpu_group                             # get_tp_group().cpu_group: 使用 TP (Tensor Parallel) 组的 CPU 通信组
+        )                                                                                   # 执行完成后 -> global_need_forward[0] = 需要 forward 的 rank 数量
+        """
+        Rank 0: local_need_forward = True  (1) ──┐
+        Rank 1: local_need_forward = False (0) ──┼
+        Rank 2: local_need_forward = True  (1) ──┘
+        Rank 3: local_need_forward = False (0) ──┘
+
+        结果: global_need_forward = [2]  (2 个 rank 需要继续)
+        """
+        # DP Attention 的要求：所有 rank 必须同步执行，保持一致的 batch 状态 && 如果 Rank 0 有请求要继续，Rank 1 即使没有请求，也要参与 forward（可能是空操作） && 否则会导致分布式死锁或状态不一致
+        global_need_forward_cnt = global_need_forward[0].item()                             # global_need_forward_cnt: 需要 forward 的 rank 数量
+        need_forward = global_need_forward_cnt > 0                                          # need_forward = global_need_forward_cnt > 0: 只要有任意一个 rank 需要继续，所有 rank 都要参与
+
         return need_forward
 
     def forward_target_extend(
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, Optional[torch.Tensor]]:
-        """Run the target extend.
-
+        """Run the target extend.                                                           # 负责目标模型（Target Model）扩展/预填充阶段
+                                                                                            # 在推测解码的 Extend 阶段，必须由 Target Model 先执行，为 Draft Model 提供初始化条件
         Args:
             batch: The batch to run. States could be modified.
 
@@ -373,18 +383,31 @@ class EAGLEWorker(TpModelWorker):
             next_token_ids: Next token ids generated.
         """
         # Forward with the target model and get hidden states.
-        # We need the full hidden states to prefill the KV cache of the draft model.
-        model_worker_batch = batch.get_model_worker_batch()
+        # We need the full hidden states to prefill the KV cache of the draft model.        # 需要 full hidden states 来为 Draft Model 的 KV cache 做预填充（prefill）
+        model_worker_batch = batch.get_model_worker_batch()                                 # 将 ScheduleBatch 转换为 ModelWorkerBatch，这是底层模型执行的标准输入格式
+        """
+        FULL: 获取所有位置的 hidden states, Extend 阶段必需：Draft 需要完整序列信息
+        LAST: 获取最后一个位置的 hidden states, Decode 阶段，只需最新状态
+        NONE: 不获取 hidden states, 纯推理，无后续处理需求
+        输入序列: [t0, t1, t2, t3, t4] (prompt tokens)
+          ↓
+        Target Model 前向传播
+          ↓
+        Hidden states: [h0, h1, h2, h3, h4]  ← FULL 模式捕获全部
+          ↓
+        Draft Model 使用 [h0, h1, h2, h3, h4] 预填充自己的 KV cache
+        使得 Draft 能从 t4 位置继续生成 t5, t6, t7...
+        """
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-        logits_output, next_token_ids = (
-            batch_result.logits_output,
-            batch_result.next_token_ids,
+        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)      # self.target_worker: 外部传入的目标模型 worker（大模型）
+        logits_output, next_token_ids = (                                                   # forward_batch_generation: 标准生成接口，执行实际的前向传播
+            batch_result.logits_output,                                                     # logits_output	包含 hidden_states（FULL 模式下的全部）、logits、可能的 mm_input_embeds -> 给 Draft Model 做初始化
+            batch_result.next_token_ids,                                                    # Target Model 生成的第一个 token（t5）-> 作为生成起点
         )
         return (
-            logits_output,
-            next_token_ids,
-            model_worker_batch.seq_lens_cpu,
+            logits_output,                                                                  # 包含 full hidden states
+            next_token_ids,                                                                 # 首个生成的 token
+            model_worker_batch.seq_lens_cpu,                                                # 序列长度（CPU 张量）
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
