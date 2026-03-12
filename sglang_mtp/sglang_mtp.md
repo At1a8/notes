@@ -71,16 +71,23 @@ Qwen3_5ForCausalLMMTP(
 ```
 ### mtp推理流程
 启动mtp后，推理流程大致如下，包括五个主要流程
-- forward_target_extend: https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L357
-  - target model的prefill
-- forward_draft_extend: https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L862
-  - draft model的prefill
-- draft: https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L532
-  - 用小draft模型快速生成候选 token 序列
-- verify: https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L691
-  - 用target模型验证draft token 的准确性
-- forward_draft_extend_after_decode: https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L902
-  - 单次decode后的draft扩展（准备下一轮token的推理）
+- Extend 阶段（新请求） 
+  - [forward_target_extend](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L357)
+    - Target Model: 标准 Extend Attention
+    - 处理 prompt tokens，输出 hidden states
+  - [forward_draft_extend](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L862)
+    - Draft Model: draft_extend_attn_backend
+    - 使用 Target 的 hidden states 初始化 KV cache, 准备 Draft 的初始状态
+- Decode 循环（生成阶段） 
+  - [draft](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L532)
+    - Draft: draft_attn_backend
+    - 多步树形注意力，快速生成 N 步候选,**** 输出: 树形结构的候选 tokens
+  - [verify](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L691)
+    - Target: 标准 Decode Attention（Verify）
+    - 并行验证所有候选路径, 输出: 接受的 tokens + 新的 hidden states
+  - [forward_draft_extend_after_decode](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/speculative/eagle_worker.py#L902)
+    - Draft: draft_extend_attn_backend（可选）
+    - 基于验证结果更新 Draft 状态, 准备下一轮 Draft
 ```mermaid
 flowchart TD
 

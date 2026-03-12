@@ -219,43 +219,43 @@ class EAGLEWorker(TpModelWorker):
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
         draft_backend_factory = DraftBackendFactory(
-            self.server_args,
-            self.draft_model_runner,
-            self.topk,
-            self.speculative_num_steps,
+            self.server_args,                                                               # 服务器配置（包含 attention 相关参数）
+            self.draft_model_runner,                                                        # draft 模型的 runner（包含模型信息和 TP group）
+            self.topk,                                                                      # 每步候选分支数（如 4）
+            self.speculative_num_steps,                                                     # 推测步数（如 5）
         )
 
         # Initialize decode attention backend
-        self.draft_attn_backend = draft_backend_factory.create_decode_backend()
+        self.draft_attn_backend = draft_backend_factory.create_decode_backend()             # decode阶段: draft model 需要多步树形注意力, 不同于标准解码注意力的单步自回归
 
         # Initialize draft extend attention backend (respects speculative_attention_mode setting)
         self.draft_extend_attn_backend = (
-            draft_backend_factory.create_draft_extend_backend()
+            draft_backend_factory.create_draft_extend_backend()                             # prefill阶段: forward_draft_extend & forward_draft_extend_after_decode 
         )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        self.cuda_graph_runner = None
-        self.cuda_graph_runner_for_draft_extend = None
+        self.cuda_graph_runner = None                                                       # Draft Decode 阶段的 CUDA Graph（多步树形生成）
+        self.cuda_graph_runner_for_draft_extend = None                                      # Draft Extend 阶段的 CUDA Graph（初始化/更新状态）
 
-        if self.server_args.disable_cuda_graph:
+        if self.server_args.disable_cuda_graph:                                             # --disable-cuda-graph 禁用了 CUDA Graph
             return
 
-        Device2DraftCudaGraphRunner = {
+        Device2DraftCudaGraphRunner = {                                                     # 同时支持 npu & gpu
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
         }
         # Capture draft
-        if self.speculative_num_steps > 1:
-            tic = time.perf_counter()
-            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        if self.speculative_num_steps > 1:                                                  # 只有当推测步数大于 1 时才捕获 Draft Decode CUDA Graph
+            tic = time.perf_counter()                                                       # 只生成 1 个候选 token，CUDA Graph 收益小, 多步生成，需要重复执行，Graph 优化价值大
+            before_mem = get_available_gpu_memory(self.device, self.gpu_id)                 # memory 与 latency 监控
             logger.info(
                 f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
+                self.target_worker.device                                                   # 使用 self.target_worker.device 而非 self.device，确保与目标模型一致
             ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -263,13 +263,13 @@ class EAGLEWorker(TpModelWorker):
             )
 
         # Capture extend
-        if self.draft_extend_attn_backend and not _is_npu:
+        if self.draft_extend_attn_backend and not _is_npu:                                  # 存在独立的 extend 注意力后端（某些配置可能为 None），非 NPU 设备（NPU 暂不支持 extend 的 CUDA Graph）
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
+            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(      # 创建 Extend Graph Runner，Extend 阶段的 Graph 相对简单（单步，无树形结构），目前只有 CUDA 实现，NPU 跳过
                 self
             )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
