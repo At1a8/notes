@@ -410,19 +410,19 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.seq_lens_cpu,                                                # 序列长度（CPU 张量）
         )
 
-    def _draft_preprocess_decode(self, batch: ScheduleBatch):
-        batch.maybe_evict_swa()
+    def _draft_preprocess_decode(self, batch: ScheduleBatch):                               # 为 Draft 阶段的 Decode 做预处理，核心是分配和管理 KV cache，支持多步、多分支（top-k）的推测生成
+        batch.maybe_evict_swa()                                                             # 如果启用滑动窗口注意力(SWA)，需要放弃旧的 KV cache 条目
         for req in batch.reqs:
-            req.decode_batch_idx += 1
+            req.decode_batch_idx += 1                                                       # 记录每个请求经历的 decode 批次次数，用于日志或调度分析
 
         # Parse args
         num_seqs = batch.batch_size()
         spec_info = batch.spec_info
 
         # Accumulate penalty
-        if batch.sampling_info.penalizer_orchestrator.is_required:
+        if batch.sampling_info.penalizer_orchestrator.is_required:                          # 频率惩罚、存在惩罚
             # This is a relaxed version of penalties for speculative decoding.
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(              # 将上一轮验证接受的 token 加入惩罚统计
                 spec_info.verified_id.to(torch.int64)
             )
 
@@ -430,16 +430,16 @@ class EAGLEWorker(TpModelWorker):
         # Layout of the out_cache_loc
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
-        if self.page_size == 1:
-            alloc_len_per_decode = self.speculative_num_steps * self.topk
-            # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
-            out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
+        if self.page_size == 1:                                                             # Page Size = 1（简单情况）
+            alloc_len_per_decode = self.speculative_num_steps * self.topk                   # 每序列需要 steps * topk 个位置
+            # TODO: We only need self.speculative_num_steps - 1 * topk cache loc            # 实际上只需要 (steps - 1) * topk，因为第一个 token 已存在，这里简化处理
+            out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(               # alloc_token_slots：从内存池分配连续 token 槽
                 batch.tree_cache,
                 num_seqs * alloc_len_per_decode,
                 backup_state=True,
             )
-        else:
-            if self.topk == 1:
+        else:                                                                               # Page Size > 1（复杂情况，PagedAttention）
+            if self.topk == 1:                                                              # 子情况 B1：Top-k = 1（单分支），单分支时，只需线性扩展，无需处理分支复制
                 prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
@@ -449,17 +449,30 @@ class EAGLEWorker(TpModelWorker):
                 prefix_lens_cpu = batch.seq_lens_cpu
                 seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
                 extend_num_tokens = num_seqs * self.speculative_num_steps
-            else:
-                # In this case, the last partial page needs to be duplicated.
+            else:                                                                           # 子情况 B2：Top-k > 1（多分支，最复杂）
+                # In this case, the last partial page needs to be duplicated.               # 大页（page_size > 1）+ 多分支（topk > 1）时，最后一个部分填充的页需要复制多份
                 # KV cache layout in batch.req_to_token_pool.req_to_token:
                 #
                 # | -------- | -- xxxx .. | -- xxxx .. | -- xxxx .. |
-                #    prefix     top-k = 0    tok-k = 1    top-k = 2
+                #    prefix     top-k = 0    top-k = 1    top-k = 2
                 #
                 #  "-" means prefix tokens
                 #  "x" means speculative draft tokens
                 #  "." means padded tokens
+                """
+                假设 page_size = 4, topk = 3, 当前 seq_len = 10
 
+                物理 KV cache 布局：
+                [0,1,2,3] [4,5,6,7] [8,9,_,_]  ← 最后一页只有 2 个有效 token (8,9)
+
+                为 3 个分支各分配新页：
+                [0,1,2,3] [4,5,6,7] [8,9,_,_] [10,11,12,13]  ← top-k=0 分支
+                                        ↓ 复制 8,9
+                                    [8,9,_,_] [14,15,16,17]  ← top-k=1 分支  
+                                        ↓ 复制 8,9
+                                    [8,9,_,_] [18,19,20,21]  ← top-k=2 分支
+                """
+                
                 (
                     prefix_lens,
                     seq_lens,
@@ -476,18 +489,18 @@ class EAGLEWorker(TpModelWorker):
                     self.page_size,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
-                last_page_lens_cpu = prefix_lens_cpu % self.page_size
-                num_new_pages_per_topk = (
-                    last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
+                last_page_lens_cpu = prefix_lens_cpu % self.page_size                       # 最后一页已有 token 数
+                num_new_pages_per_topk = (                                                  # 每个分支需要的新页数（向上取整）         
+                    last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1    # 额外的 self.page_size - 1 是为了免去除完再向上取整
                 ) // self.page_size
-                seq_lens_cpu = (
-                    prefix_lens_cpu // self.page_size * self.page_size
+                seq_lens_cpu = (                                                            # 扩展后的总长度（考虑多分支复制）
+                    prefix_lens_cpu // self.page_size * self.page_size                      # prefix 向下取整
                     + num_new_pages_per_topk * (self.page_size * self.topk)
                 )
                 extend_num_tokens = torch.sum((seq_lens_cpu - prefix_lens_cpu)).item()
 
             out_cache_loc, token_to_kv_pool_state_backup = (
-                alloc_paged_token_slots_extend(
+                alloc_paged_token_slots_extend(                                             # 大页场景下的分配函数，处理复杂的页表管理
                     batch.tree_cache,
                     prefix_lens,
                     prefix_lens_cpu,
@@ -499,13 +512,13 @@ class EAGLEWorker(TpModelWorker):
                 )
             )
 
-        if self.page_size > 1 and self.topk > 1:
+        if self.page_size > 1 and self.topk > 1:                                            # 处理大页复制（page_size > 1 && Top-k > 1 时）
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-            duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (self.topk - 1)
-            target_cache_loc = torch.zeros(
+            duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (self.topk - 1)    # 需要复制的 KV 条目总数
+            target_cache_loc = torch.zeros(                                                 # 目标位置（新分配的页）
                 duplicate_cache_len, dtype=torch.int32, device=self.device
             )
-            source_cache_loc = torch.zeros(
+            source_cache_loc = torch.zeros(                                                 # 源位置（原始最后一页）
                 duplicate_cache_len, dtype=torch.int32, device=self.device
             )
         else:
@@ -513,7 +526,10 @@ class EAGLEWorker(TpModelWorker):
             duplicate_cache_len = 0
             source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
 
-        assign_draft_cache_locs[(num_seqs,)](
+        # 1. 更新 req_to_token 映射表
+        # 2. 为每个分支分配独立的页序列
+        # 3. 记录需要复制的 KV 位置
+        assign_draft_cache_locs[(num_seqs,)](                                               # Triton Kernel 执行 Cache 位置分配, [(num_seqs,)] → 每序列一个 block 并行处理
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
@@ -532,38 +548,41 @@ class EAGLEWorker(TpModelWorker):
             next_power_of_2(self.speculative_num_steps + self.page_size),
         )
 
-        if self.page_size > 1 and self.topk > 1:
+        if self.page_size > 1 and self.topk > 1:                                            # 执行 KV 复制和清理
             if duplicate_cache_len > 0:
-                self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                self.draft_model_runner.token_to_kv_pool.move_kv_cache(                     # 物理复制：将原始最后一页的 KV 值复制到各分支的新页
                     target_cache_loc, source_cache_loc
                 )
             # Remove padded slots
             # TODO: We only need self.speculative_num_steps - 1 cache loc
             out_cache_loc = out_cache_loc[
-                : num_seqs * self.topk * self.speculative_num_steps
+                : num_seqs * self.topk * self.speculative_num_steps                         # 裁剪：移除为对齐页大小而分配的额外 padding，只保留实际需要的 steps * topk 个位置
             ]
 
-        batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
-        batch.return_hidden_states = False
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
-        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+        batch.out_cache_loc = out_cache_loc                                                 # 分配的 KV cache 位置，供 Draft forward 使用
+        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()                               # 总序列长度（用于注意力计算）
+        batch.return_hidden_states = False                                                  # 不返回 hidden states
+        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)            # 每个分支的起始位置（[len0, len0, len0, len1, len1, len1, ...] 重复 topk 次）
+        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)        # 恢复分配器状态：为可能的回滚或重试做准备（推测解码验证失败时需要）
 
-    def _draft_preprocess_idle(self, batch: ScheduleBatch):
-        batch.spec_info = EagleDraftInput.create_idle_input(
+    # Data Parallel Attention 场景：
+    # 多个 GPU (ranks) 并行处理不同请求, 但某些时刻，某个 rank 可能没有分配到请求, 此时该 rank 处于 "idle" 状态
+    # 分布式训练/推理需要所有 rank 同步执行, 如果 rank 0 有数据要处理，rank 1 空闲, rank 1 不能真的"什么都不做"，否则会死锁
+    def _draft_preprocess_idle(self, batch: ScheduleBatch):                                 # 处理 DP (Data Parallel) Attention 模式下的 idle（空闲）batch
+        batch.spec_info = EagleDraftInput.create_idle_input(                                # 生成一个"空"的输入对象
             device=self.device,
-            hidden_size=self.model_config.hidden_size,
+            hidden_size=self.model_config.hidden_size,                                      # 从模型配置获取，如 4096、8192 等
             dtype=self.model_config.dtype,
             topk=self.topk,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=CaptureHiddenMode.LAST,                                     # LAST，捕获最后位置的 hidden state，即使 idle 也保持与其他模式一致
         )
 
     def draft(self, batch: ScheduleBatch):
         # Parse args
-        if batch.forward_mode.is_idle():
-            self._draft_preprocess_idle(batch)
-        else:
-            self._draft_preprocess_decode(batch)
+        if batch.forward_mode.is_idle():                                                    # DP Attention 下某些 rank 无数据
+            self._draft_preprocess_idle(batch)                                              # 创建 dummy 输入，保持同步
+        else:                                                                               # 正常生成
+            self._draft_preprocess_decode(batch)                                            # 分配 KV cache、更新位置、准备树形结构
 
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -891,42 +910,71 @@ class EAGLEWorker(TpModelWorker):
     def forward_draft_extend(
         self,
         batch: ScheduleBatch,
-        hidden_states: torch.Tensor,
-        next_token_ids: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
-        mm_input_embeds: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,                                                        # 来自 Target Model 的 full hidden states
+        next_token_ids: torch.Tensor,                                                       # Target 生成的首个 token
+        seq_lens_cpu: Optional[torch.Tensor],                                               # 序列长度（CPU 张量）
+        mm_input_embeds: Optional[torch.Tensor] = None,                                     # 多模态输入（可选）
     ):
-        """Run draft model extend. This API modifies the states of the batch.
+        """Run draft model extend. This API modifies the states of the batch.               # Extend 阶段中 Draft Model 的初始化步骤，使用 Target Model 的输出对齐 Draft 的状态
 
         Args:
             batch: The batch to run.
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
+            
+        Example:
+        Input                                                           
+        ├── hidden_states: [h0, h1, h2, h3, h4] (from Target)         
+        ├── next_token_ids: [t5] (from Target)                        
+        └── seq_lens_cpu: 5                                           
+                                                                
+             ↓                                                         
+        EagleDraftInput                                                
+        ├── hidden_states = [h0, h1, h2, h3, h4]                      
+        ├── verified_id = [t5]                                        
+        └── num_tokens_per_req = 1                                    
+                                                                       
+             ↓                                                         
+        Draft Model (如 Qwen3_5ForCausalLMMTP)                         
+        ├── 输入: concat([emb(t5), h4]) @ fc → hidden                
+        ├── 过 1 层 transformer                                       
+        └── 输出: logits_output (预测 t6 的分布)                      
+                                                                       
+             ↓                                                         
+        capture_for_decode                                             
+        ├── topk_p = [0.4, 0.3, 0.2, 0.1]  (top-4 概率)               
+        ├── topk_index = [t6_a, t6_b, t6_c, t6_d]  (top-4 tokens)     
+        └── hidden_states = h5 (Draft 的最终状态)                     
+                                                                       
+        结果: batch.spec_info 已更新，准备好进入 Decode 循环           
         """
-        batch.spec_info = EagleDraftInput(
-            hidden_states=hidden_states,
-            verified_id=next_token_ids,
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
+        batch.spec_info = EagleDraftInput(                                                  # 封装 Draft Model 的输入信息, Draft Model 不看原始文本，而是看 Target Model 的 hidden states
+            hidden_states=hidden_states,                                                    # Target 的 full hidden states
+            verified_id=next_token_ids,                                                     # Target 验证过的首个 token
+            num_tokens_per_req=1,                                                           # 每个请求 1 个 token（初始化）
+            num_tokens_for_logprob_per_req=1,                                               # logprob 计算 1 个 token
         )
-        batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch(
+        batch.return_hidden_states = False                                                  # Extend 阶段不需要返回 hidden states（只需要 Draft 内部使用）
+        batch.spec_info.prepare_for_extend(batch)                                           # 准备 extend 所需的 metadata（如位置编码、mask 等）
+        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST                        # Draft 只需捕获最后位置的 hidden state（用于生成下一个 token）, 作为对比, Target 用 FULL（需要给 Draft 提供完整信息）
+        model_worker_batch = batch.get_model_worker_batch(                                  # ScheduleBatch → ModelWorkerBatch: 标准模型输入格式
             seq_lens_cpu_cache=seq_lens_cpu
         )
-        forward_batch = ForwardBatch.init_new(
+        forward_batch = ForwardBatch.init_new(                                              # ModelWorkerBatch → ForwardBatch: 添加 Draft Model 特定的运行信息
             model_worker_batch, self.draft_model_runner
         )
-        forward_batch.return_logprob = False
-        if mm_input_embeds is not None:
+        forward_batch.return_logprob = False                                                # 不计算 token 的 log probabilities
+        if mm_input_embeds is not None:                                                     # 多模态处理：如果有 mm_input_embeds（多模态嵌入），传递给 forward batch
             forward_batch.mm_input_embeds = mm_input_embeds
-        logits_output = self.draft_model_runner.forward(forward_batch).logits_output
+        # self.draft_model_runner: Draft Model 的执行器, 如 Qwen3_5ForCausalLMMTP
+        # 输入包含 Target 的 hidden_states（通过 forward_batch.spec_info）
+        # 输出 logits_output 包含 Draft 预测的 logits 和 hidden states
+        logits_output = self.draft_model_runner.forward(forward_batch).logits_output        
         if self.enable_nan_detection:
-            detect_nan(logits_output)
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+            detect_nan(logits_output)                                                       # 检查输出是否有 NaN（训练/调试时使用）
+        assert isinstance(forward_batch.spec_info, EagleDraftInput)                         # 确保 spec_info 类型正确
+        assert forward_batch.spec_info is batch.spec_info                                   # 确保 forward_batch 和 batch 共享同一个 spec_info 对象（原地修改）
+        self.capture_for_decode(logits_output, forward_batch.spec_info)                     # 捕获 Draft 的输出，为 Decode 阶段做准备
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
@@ -1022,8 +1070,8 @@ class EAGLEWorker(TpModelWorker):
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
-        draft_input.hidden_states = logits_output.hidden_states
+        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)    # topk_p: Top-k 概率值, topk_index: Top-k token IDs
+        draft_input.hidden_states = logits_output.hidden_states                             # hidden_states: 最后位置的 hidden state
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
