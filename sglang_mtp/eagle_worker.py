@@ -585,40 +585,40 @@ class EAGLEWorker(TpModelWorker):
             self._draft_preprocess_decode(batch)                                            # 分配 KV cache、更新位置、准备树形结构
 
         spec_info = batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
+        assert isinstance(spec_info, EagleDraftInput)                                       # 确保预处理后 spec_info 是正确的 EagleDraftInput 类型
 
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_req = self.topk
-        spec_info.num_tokens_for_logprob_per_req = self.topk
-        batch.return_hidden_states = False
+        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST                              # 只捕获最后位置 hidden state（多步传递用）
+        spec_info.num_tokens_per_req = self.topk                                            # 每请求生成 topk 个候选
+        spec_info.num_tokens_for_logprob_per_req = self.topk                                # 计算 topk 个 logprob
+        batch.return_hidden_states = False                                                  # 不返回 hidden states
 
         # Get forward batch
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
+        model_worker_batch = batch.get_model_worker_batch()                                 # ScheduleBatch → model_worker_batch
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST             # 只捕获最后位置 hidden state
+        forward_batch = ForwardBatch.init_new(                                              # model_worker_batch -> forward_batch
             model_worker_batch, self.draft_model_runner
         )
-        can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
+        can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(         # 判断是否能用 cuda graph 加速（需满足 batch 大小、序列长度等条件）
             forward_batch
         )
-        if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
+        if can_cuda_graph:                                                                  # cuda graph 可用
+            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(    # 直接 replay 预录制的图，返回树形结构参数
                 forward_batch
             )
-        else:
-            forward_batch.can_run_dp_cuda_graph = False
+        else:                                                                               # cuda graph 不可用
+            forward_batch.can_run_dp_cuda_graph = False                                     # 标记不使用 DP CUDA Graph
             if (
-                not forward_batch.forward_mode.is_idle()
+                not forward_batch.forward_mode.is_idle()                                    # 多步且非 idle 时，初始化注意力后端的 forward metadata（树形注意力用）
                 and self.speculative_num_steps > 1
             ):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
+            parent_list, top_scores_index, draft_tokens = self.draft_forward(               # 调用 draft_forward 执行实际多步前向传播
                 forward_batch
             )
 
-        if batch.forward_mode.is_idle():
+        if batch.forward_mode.is_idle():                                                    # idle 提前返回：DP 模式下无数据的 rank 返回 dummy 输入，保持同步
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
@@ -626,17 +626,17 @@ class EAGLEWorker(TpModelWorker):
             )
 
         (
-            tree_mask,
-            position,
+            tree_mask,                                                                      # 树形因果注意力掩码
+            position,                                                                       # 每个节点的位置编码
             retrive_index,
             retrive_next_token,
             retrive_next_sibling,
             draft_tokens,
-        ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
+        ) = build_tree_kernel_efficient(                                                    # 将线性生成的 tokens 转换为树形结构，供 Target Model 并行验证
+            spec_info.verified_id,                                                          # 起点 token（来自上一轮验证）
+            parent_list,                                                                    # 树形父节点关系
+            top_scores_index,                                                               # top-k 选择索引
+            draft_tokens,                                                                   # 原始草稿 tokens
             batch.seq_lens,
             batch.seq_lens_sum,
             self.topk,
@@ -655,7 +655,7 @@ class EAGLEWorker(TpModelWorker):
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.server_args.speculative_num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=CaptureHiddenMode.FULL,                                     # 关键：Verify 步骤需要 FULL 模式记录所有完整的 hidden states
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
