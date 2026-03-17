@@ -662,45 +662,45 @@ class EAGLEWorker(TpModelWorker):
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
-        spec_info = forward_batch.spec_info
+        spec_info = forward_batch.spec_info                                                 # forward_batch 获取 spec_info（包含初始 hidden states 和 top-k 信息）
         assert isinstance(spec_info, EagleDraftInput)
-        out_cache_loc = forward_batch.out_cache_loc
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
+        out_cache_loc = forward_batch.out_cache_loc                                         # forward_batch 获取 out_cache_loc（KV cache 位置）
+        topk_p, topk_index, hidden_states = (                                               # 获取初始状态, 来自 forward_draft_extend 或上一轮的结果
+            spec_info.topk_p,                                                               # top-k 概率值
+            spec_info.topk_index,                                                           # top-k token IDs
+            spec_info.hidden_states,                                                        # 最后位置的 hidden state
         )
-        if self.hot_token_id is not None:
+        if self.hot_token_id is not None:                                                   # 如果使用了热词表限制，将索引映射回实际词表
             topk_index = self.hot_token_id[topk_index]
         # TODO: We only need self.speculative_num_steps - 1 cache loc
-        out_cache_loc = out_cache_loc.reshape(
+        out_cache_loc = out_cache_loc.reshape(                                              # kv cache 位置重排: [batch, topk, steps]
             forward_batch.batch_size, self.topk, self.speculative_num_steps
         )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(                           # 进一步重拍: [steps, batch, topk] -> [steps, -1] 
+            self.speculative_num_steps, -1                                                  # 按时间步组织，循环中 out_cache_loc[i] 即可取当前步的位置
         )
 
-        # Return values
+        # Return values, 每步的树形结构信息
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
         # Forward multiple steps
         scores = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+        for i in range(self.speculative_num_steps):                                         # 循环执行 forward
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(              # 从 top-k 中选择当前步的输入 token, 更新 hidden states
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+            score_list.append(tree_info[0])                                                 # token 分数（用于后续组织树结构）
+            token_list.append(tree_info[1])                                                 # 选中的 token IDs
+            parents_list.append(tree_info[2])                                               # 父节点索引（构建树形关系）
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
+            if i == self.speculative_num_steps - 1:                                         # 最后一步不需要执行 forward, Extend 阶段已经预填充了 1 个 token
+                break                                                                       # 这里只需要生成 steps - 1 个新 token, 最后一步直接 break，节省一次 forward
 
             # Set inputs
-            forward_batch.input_ids = input_ids
+            forward_batch.input_ids = input_ids                                             # draft 当前步选中的 token IDs
             # This is a temporary fix for the case that the user is using standalone
             # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
             # rope kernel needs cache_loc to be contiguous.
